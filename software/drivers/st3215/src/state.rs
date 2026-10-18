@@ -179,7 +179,15 @@ impl ST3215BusCommunicator {
         if res.is_err() {
             return Err(Box::new(res.err().unwrap()));
         }
+        if let Err(error) = crate::calibration_store::persist(std::path::Path::new("calibration"), envelope) {
+            log::warn!("Failed to persist calibration for bus '{}': {}", envelope.bus_serial, error);
+        }
         Ok(())
+    }
+
+    /// Recover frozen calibration only when queue history has no record for this bus.
+    pub fn load_meta_file(bus_serial: &str) -> Option<st3215_proto::MetaEnvelope> {
+        crate::calibration_store::load(std::path::Path::new("calibration"), bus_serial)
     }
 
     fn add_bus(&self, bus_info: &st3215_proto::St3215Bus, envelope: &st3215_proto::RxEnvelope) {

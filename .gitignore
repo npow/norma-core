@@ -9,3 +9,6 @@ js-vendor/
 # shared/libcamera/Makefile and the build-libcamera job in
 # .github/workflows/station-release.yml.
 shared/libcamera/library/
+
+# Local frozen motor calibration (machine-specific).
+/calibration/
