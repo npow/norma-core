@@ -57,7 +57,6 @@ from smolvla.stats import load_stats  # noqa: E402
 
 QUEUE_ID = "inference/normvla"
 ST3215_TARGET_POS_REGISTER = 0x2A
-IMAGE_KEYS = ("observation.images.cam0", "observation.images.cam1")
 
 
 def parse_args() -> argparse.Namespace:
@@ -180,7 +179,7 @@ def predict_commands(
     device: torch.device,
 ) -> tuple[commands.DriverCommand, np.ndarray, np.ndarray, list[tuple[int, int]]]:
     """Returns (single sync-write command, predicted_goal_norm[6], raw_ticks[6], ranges)."""
-    batch, ranges = frame_to_batch(frame, stats, IMAGE_KEYS, device)
+    batch, ranges = frame_to_batch(frame, stats, tuple(policy.config.image_keys), device)
     tokens, mask = policy.tokenize_task(task, device=device)
     batch["observation.language.tokens"] = tokens
     batch["observation.language.attention_mask"] = mask
@@ -302,7 +301,11 @@ async def main_async() -> None:
     logger = logging.getLogger("run_policy")
     motor_ids = [int(x) for x in args.motor_ids.split(",")]
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(
+        "cuda" if torch.cuda.is_available()
+        else "mps" if torch.backends.mps.is_available()
+        else "cpu"
+    )
 
     stats_path = args.checkpoint / "stats.safetensors"
     if not stats_path.exists():
@@ -316,6 +319,8 @@ async def main_async() -> None:
         strict=False,
     ).to(device)
     policy.eval()
+
+    print(f"cameras:   {tuple(policy.config.image_keys)}")
 
     print(f"task:      {args.task!r}")
     print(f"server:    {args.server}")
