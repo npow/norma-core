@@ -342,3 +342,112 @@ ADB. It forwards terminal input and command arguments; compute stays on Arduino.
 Set `SMOLVLA_ADB_SERIAL` for another device or `SMOLVLA_ARDUINO_RUNNER` for another
 absolute runner path (`SMOLVLA_REMOTE_RUNNER` is also accepted). The default runner is
 `/home/arduino/smolvla-white-lid/variants/192px-ab2-4/run_smolvla_white_lid.sh`.
+
+### Record rollouts with leader takeover
+
+Executed rollouts now record locally by default, including every policy-controlled,
+transition, and human-controlled control tick. Use a new dataset directory, separate
+from the original demonstrations:
+
+```bash
+./run_smolvla_white_lid.sh --execute --teleop-takeover \
+  --dataset-root ~/datasets/white-lid-interventions
+```
+
+ACT supports the same arguments via `./run_act_white_lid.sh`. For a policy server
+that is already running, use `uv run python rollout_act.py` with these arguments
+and `--policy-url URL`. These changes are in the local controller; an Arduino
+runner installed elsewhere must receive the updated Python files before it can
+use these flags. Preview (omit `--execute`) performs no writes and creates no
+training episodes. `--no-record` explicitly disables recording for an executed run.
+Without `--dataset-root`, each launch creates a new directory under
+`~/datasets/rollout-interventions/session-TIMESTAMP/` and prints the path.
+
+| Key | Action |
+| --- | --- |
+| Space | Start an episode, or pause and save the current one |
+| `t` / grab leader | Take over; the policy stays disengaged until explicit resume |
+| `r` | Request a fresh policy prediction, then blend back to policy control |
+| `s` / `f` | End and save the episode as success / failure |
+| `q` / Ctrl-C | Stop motion, save the partial episode, and finish pending writes |
+
+During policy execution, the leader tracks the **measured follower pose** through
+both arms' calibrated ranges. The leader receives a temporary RAM torque cap
+(`--leader-torque-limit 100`, raw units), never higher than its existing limit.
+The controller seeds current-position goals before torque enable and applies the
+same calibrated limits, current protection, and per-tick movement limits in both
+directions. Takeover disables leader torque, cancels outstanding predictions, and
+switches the follower to leader control. Both handoffs start from the last sent
+follower goal and decay the initial pose mismatch over `--handoff-seconds 0.3`;
+these frames are marked `transition`. The follower remains human-controlled while
+resume waits for a fresh prediction. Pausing or exiting releases both arms;
+support them. On exit, the original leader RAM torque limits are restored with
+torque left disabled. EEPROM/PID settings are not changed.
+
+Automatic grab detection requires sustained position disagreement **and** current
+on the same leader joint, using distinct telemetry frames. Position disagreement
+is measured against the full mirrored follower pose, rather than the slew-limited
+motor goal. Defaults are `--grab-error-ticks 80 --grab-current 40 --grab-seconds 0.15`,
+with a 0.75-second grace period after enabling the leader. These are initial tuning
+values, **not physically validated thresholds**. Gravity, tracking lag, and joint
+friction can trigger them; too little torque can also prevent mirroring. Use
+`--no-auto-takeover` for an initial test with the `t` key, then inspect the saved
+leader positions, tracking targets, and currents before tuning automatic detection.
+The `r` key is always required to return control to the policy.
+
+The dataset contains standard camera videos, pre-action follower observations,
+and protected absolute follower goals (`action`), including retained goals when
+no new command is sent. Additional fields preserve `intervention.policy_action`,
+`intervention.leader_state`, and integer validity masks. `intervention.owner` is
+`0=policy`, `1=human`, `2=transition`; resume waiting is also marked transition.
+Frames begin when control starts, after the first fresh prediction, and continue
+through human corrections and resume waiting. Idle/reset time is not recorded.
+
+`meta/interventions/episode-NNNNNN.jsonl` preserves per-frame real times, source
+motor/camera timestamps, ownership, requested/predicted/sent actions, currents,
+and actual motor commands. The matching `.json` records checkpoint identity,
+control/detection settings, outcome, interruption status, exact frame/ownership
+counts, an original-frame SHA256, and SHA256 checksums of finalized Parquet,
+video, and journal files. Video compression is lossy; the original-frame hash
+identifies the capture, while file checksums verify saved artifacts.
+
+Capture and encoding run outside the motor loop. The default queue holds at most
+64 frames (`--record-queue-frames`), and pending image writes are bounded too.
+A full queue or disk error stops motion rather than allowing an unbounded backlog.
+Clean exit drains pending writes; power loss or forced termination can leave an
+unfinished episode. On reopening, unindexed journals and unfinished images are
+preserved in a sibling recovery directory. Missing audits for indexed episodes
+require review and a new capture root. Compatible datasets can be appended across
+launches; hardware, calibration, views, FPS, and feature schema must match. Each
+episode retains its own checkpoint identity. Do not run `record.py` concurrently
+against the same arms.
+
+### Export corrections for fine-tuning
+
+Keep the full rollout dataset as the record of what happened. Export human-only
+segments into a new ordinary LeRobot dataset after quitting the rollout and before
+imitation fine-tuning:
+
+```bash
+uv run python export_interventions.py \
+  --source ~/datasets/white-lid-interventions \
+  --output ~/datasets/white-lid-corrections \
+  --min-frames 50
+```
+
+Choose `--min-frames` for the model's training chunk length (50 is an example).
+The exporter verifies saved file checksums, frame denominators, and ownership
+labels. It splits at ownership changes, episode boundaries, and real capture gaps
+over 1.5 frame periods, excludes transition frames, and never labels autonomous
+policy actions as demonstrations. The output contains only ordinary state/action,
+camera, and task features, plus a provenance manifest with source ranges, counts,
+and decoded-frame hashes. An existing output directory is refused. Human segments
+from incomplete or failed trials remain eligible: review their quality before
+training. Mix reviewed corrections with original demonstrations when fine-tuning;
+recording does not automatically launch training or rent compute.
+
+Hardware-free verification:
+
+```bash
+uv run python -m unittest -v test_rollout_act test_record test_intervention
+```
