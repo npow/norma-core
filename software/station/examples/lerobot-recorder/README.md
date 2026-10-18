@@ -308,6 +308,6 @@ these repositories does not automatically change which checkpoint a launcher sel
 
 Run `./run_smolvla_ventuno_white_lid.sh` to use the Arduino-local runner through
 ADB. It forwards terminal input and command arguments; compute stays on Arduino.
-Set `SMOLVLA_ADB_SERIAL` for another device or `SMOLVLA_REMOTE_RUNNER` for another
-absolute runner path. The default runner is
-`/home/arduino/smolvla-white-lid/run_smolvla_white_lid.sh`.
+Set `SMOLVLA_ADB_SERIAL` for another device or `SMOLVLA_ARDUINO_RUNNER` for another
+absolute runner path (`SMOLVLA_REMOTE_RUNNER` is also accepted). The default runner is
+`/home/arduino/smolvla-white-lid/variants/192px-ab2-4/run_smolvla_white_lid.sh`.
