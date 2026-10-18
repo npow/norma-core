@@ -12,7 +12,7 @@ use log::{debug, error, info};
 use parking_lot::Mutex;
 use prost::Message;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
@@ -26,13 +26,40 @@ pub const ST3215_SLOW_READ_WARN_MS: u128 = 10;
 
 const NO_COMMAND_SEARCH_DELAY_MS: u64 = 500;
 const MIN_TIME_BETWEEN_SEARCHES_MS: u64 = 100;
+// After this command-drain interval, finish a motor scan before more commands.
+// Serial transaction latency can extend this interval.
+const FORCED_SCAN_INTERVAL_MS: u64 = 100;
 pub const MAX_MOTORS_CNT: u8 = 8;
+
+enum PortWork {
+    Command(TxEnvelope),
+    Scan,
+}
+
+enum ScanResult {
+    Complete,
+    Interrupted,
+    Disconnected,
+}
+
+// Stop draining commands once a scan is due, even if recv() is always ready.
+async fn next_port_work(
+    commands: &mut mpsc::UnboundedReceiver<TxEnvelope>,
+    ticks: &mut tokio::time::Interval,
+    last_scan: Instant,
+) -> PortWork {
+    tokio::select! {
+        biased;
+        Some(command) = commands.recv(), if last_scan.elapsed() < Duration::from_millis(FORCED_SCAN_INTERVAL_MS) => PortWork::Command(command),
+        _ = ticks.tick() => PortWork::Scan,
+    }
+}
 
 pub struct St3215Port {
     port_info: SerialPortInfo,
     bus_info: St3215BusProto,
     com: Arc<ST3215BusCommunicator>,
-    command_waiting: Arc<AtomicBool>,
+    pending_commands: Arc<AtomicUsize>,
     meta: Arc<St3215PortMeta>,
     eeprom_cache: Arc<Mutex<HashMap<u8, Bytes>>>,
 }
@@ -48,7 +75,7 @@ impl St3215Port {
             port_info,
             bus_info,
             com,
-            command_waiting: Arc::new(AtomicBool::new(false)),
+            pending_commands: Arc::new(AtomicUsize::new(0)),
             meta: Arc::new(meta),
             eeprom_cache: Arc::new(Mutex::new(HashMap::new())),
         })
@@ -72,7 +99,7 @@ impl St3215Port {
 
         let (done_tx, mut done_rx) = mpsc::channel::<Result<(), String>>(1);
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<TxEnvelope>();
-        let command_waiting = self.command_waiting.clone();
+        let pending_commands = self.pending_commands.clone();
 
         // Subscribe to tx_queue_id for receiving commands
         let serial_for_filter = self.bus_info.serial_number.clone();
@@ -85,8 +112,9 @@ impl St3215Port {
                 for (_id, data) in entries {
                     if let Ok(envelope) = TxEnvelope::decode(data.as_ref()) {
                         if envelope.target_bus_serial == serial_for_filter {
-                            command_waiting.store(true, Ordering::SeqCst);
+                            pending_commands.fetch_add(1, Ordering::SeqCst);
                             if let Err(e) = cmd_tx_clone.send(envelope) {
+                                pending_commands.fetch_sub(1, Ordering::SeqCst);
                                 error!("Failed to send command to channel: {}", e);
                                 return false;
                             }
@@ -99,7 +127,7 @@ impl St3215Port {
 
         let com = self.com.clone();
         let bus_info = self.bus_info.clone();
-        let worker_command_waiting = self.command_waiting.clone();
+        let worker_pending_commands = self.pending_commands.clone();
         let meta = self.meta.clone();
         let eeprom_cache = self.eeprom_cache.clone();
 
@@ -110,7 +138,7 @@ impl St3215Port {
                 bus_info,
                 done_tx,
                 cmd_rx,
-                worker_command_waiting,
+                worker_pending_commands,
                 meta,
                 eeprom_cache,
             )
@@ -125,8 +153,8 @@ impl St3215Port {
         Ok(())
     }
 
-    fn should_break_read(command_waiting: &Arc<AtomicBool>) -> bool {
-        command_waiting.load(Ordering::SeqCst)
+    fn should_break_read(pending_commands: &Arc<AtomicUsize>) -> bool {
+        pending_commands.load(Ordering::SeqCst) > 0
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -136,7 +164,7 @@ impl St3215Port {
         bus_info: St3215BusProto,
         done_tx: mpsc::Sender<Result<(), String>>,
         mut cmd_rx: mpsc::UnboundedReceiver<TxEnvelope>,
-        command_waiting: Arc<AtomicBool>,
+        pending_commands: Arc<AtomicUsize>,
         meta: Arc<St3215PortMeta>,
         eeprom_cache: Arc<Mutex<HashMap<u8, Bytes>>>,
     ) {
@@ -147,11 +175,12 @@ impl St3215Port {
 
         let mut last_command_time = Instant::now();
         let mut last_search_time = Instant::now();
+        let mut last_scan_time = Instant::now();
 
         loop {
-            tokio::select! {
-                Some(command) = cmd_rx.recv() => {
-                    command_waiting.store(false, Ordering::SeqCst);
+            match next_port_work(&mut cmd_rx, &mut interval, last_scan_time).await {
+                PortWork::Command(command) => {
+                    pending_commands.fetch_sub(1, Ordering::SeqCst);
                     last_command_time = Instant::now();
 
                     // Calculate command receive latency
@@ -240,8 +269,11 @@ impl St3215Port {
                         eeprom_cache.lock().remove(&old_motor_id);
                     }
                 }
-                _ = interval.tick() => {
-                    if Self::should_break_read(&command_waiting) {
+                PortWork::Scan => {
+                    // Complete a scan after the command-drain deadline. A slow
+                    // serial transaction can still extend the interval.
+                    let force_scan = last_scan_time.elapsed() >= Duration::from_millis(FORCED_SCAN_INTERVAL_MS);
+                    if Self::should_break_read(&pending_commands) && !force_scan {
                         continue;
                     }
 
@@ -252,14 +284,14 @@ impl St3215Port {
                         last_search_time = Instant::now();
                     }
 
-                    if !Self::scan_motors(&mut port, &com, &bus_info, &mut last_seen_motors, &mut missing_since, &command_waiting, search_for_new, &eeprom_cache).await {
-                        log::warn!("ST3215 port disconnected: {}", bus_info.port_name);
-                        break;
+                    match Self::scan_motors(&mut port, &com, &bus_info, &mut last_seen_motors, &mut missing_since, &pending_commands, search_for_new, force_scan, &eeprom_cache).await {
+                        ScanResult::Complete => last_scan_time = Instant::now(),
+                        ScanResult::Interrupted => {},
+                        ScanResult::Disconnected => {
+                            log::warn!("ST3215 port disconnected: {}", bus_info.port_name);
+                            break;
+                        }
                     }
-                }
-                else => {
-                    log::warn!("ST3215 command channel closed, exiting port worker: {}", bus_info.port_name);
-                    break;
                 }
             }
         }
@@ -268,16 +300,18 @@ impl St3215Port {
         drop(done_tx.send(Ok(())));
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn scan_motors(
         port: &mut tokio_serial::SerialStream,
         com: &Arc<ST3215BusCommunicator>,
         bus_info: &St3215BusProto,
         last_seen_motors: &mut HashSet<u8>,
         missing_since: &mut HashMap<u8, Instant>,
-        command_waiting: &Arc<AtomicBool>,
+        pending_commands: &Arc<AtomicUsize>,
         search_for_new: bool,
+        force: bool,
         eeprom_cache: &Arc<Mutex<HashMap<u8, Bytes>>>,
-    ) -> bool {
+    ) -> ScanResult {
         let mut currently_seen_motors = HashSet::new();
         let eeprom_size = protocol::RamRegister::TorqueEnable.address() as usize;
         let ram_size = (protocol::RamRegister::PresentCurrent.address()
@@ -286,8 +320,8 @@ impl St3215Port {
         let full_size = eeprom_size + ram_size;
 
         for &motor_id in last_seen_motors.iter() {
-            if Self::should_break_read(command_waiting) {
-                return true;
+            if !force && Self::should_break_read(pending_commands) {
+                return ScanResult::Interrupted;
             }
 
             let cached_eeprom = eeprom_cache.lock().get(&motor_id).cloned();
@@ -320,7 +354,7 @@ impl St3215Port {
                     };
 
                     if Self::send_drive_state_envelope(com, bus_info, motor_id, final_data).is_err() {
-                        return false;
+                        return ScanResult::Disconnected;
                     }
                 }
                 Err(ref e) => {
@@ -356,7 +390,7 @@ impl St3215Port {
                             )
                             .is_err()
                             {
-                                return false;
+                                return ScanResult::Disconnected;
                             }
                         }
                     }
@@ -380,7 +414,7 @@ impl St3215Port {
                 eeprom_cache.lock().remove(&motor_id);
                 missing_since.remove(&motor_id);
                 if Self::send_drive_disconnect_envelope(com, bus_info, motor_id).is_err() {
-                    return false;
+                    return ScanResult::Disconnected;
                 }
             } else {
                 // Still within grace — keep the motor in last_seen so we retry next tick.
@@ -394,11 +428,11 @@ impl St3215Port {
 
         if !search_for_new {
             *last_seen_motors = currently_seen_motors;
-            return true;
+            return ScanResult::Complete;
         }
 
-        if Self::should_break_read(command_waiting) {
-            return true;
+        if Self::should_break_read(pending_commands) {
+            return ScanResult::Complete;
         }
         match Self::search_motors_ignoring(
             port,
@@ -406,13 +440,13 @@ impl St3215Port {
             &currently_seen_motors,
             com,
             bus_info,
-            command_waiting,
+            pending_commands,
         )
         .await
         {
             Ok(new_motors) => {
                 for motor_id in new_motors {
-                    if Self::should_break_read(command_waiting) {
+                    if Self::should_break_read(pending_commands) {
                         break;
                     }
                     currently_seen_motors.insert(motor_id);
@@ -422,11 +456,11 @@ impl St3215Port {
                         motor_id
                     );
                     if Self::send_drive_connect_envelope(com, bus_info, motor_id).is_err() {
-                        return false;
+                        return ScanResult::Disconnected;
                     }
                 }
                 *last_seen_motors = currently_seen_motors;
-                true
+                ScanResult::Complete
             }
             Err(e) => {
                 if let protocol::Error::Io {
@@ -438,11 +472,11 @@ impl St3215Port {
                         io_err.kind(),
                         io_err
                     );
-                    return false;
+                    return ScanResult::Disconnected;
                 }
                 error!("Failed to search for new motors: {}", e);
                 *last_seen_motors = currently_seen_motors;
-                true
+                ScanResult::Complete
             }
         }
     }
@@ -453,11 +487,11 @@ impl St3215Port {
         ignore_ids: &HashSet<u8>,
         com: &Arc<ST3215BusCommunicator>,
         bus_info: &St3215BusProto,
-        command_waiting: &Arc<AtomicBool>,
+        pending_commands: &Arc<AtomicUsize>,
     ) -> Result<Vec<u8>, protocol::Error> {
         let mut found_motors = Vec::new();
         for motor_id in 1..=max_motor_id {
-            if Self::should_break_read(command_waiting) {
+            if Self::should_break_read(pending_commands) {
                 break;
             }
             if ignore_ids.contains(&motor_id) {
@@ -1386,5 +1420,39 @@ impl TxEnvelope {
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod scheduling_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn saturated_commands_cannot_starve_due_scan() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        for _ in 0..100 {
+            tx.send(TxEnvelope::default()).unwrap();
+        }
+        let mut ticks = tokio::time::interval(Duration::from_millis(20));
+        let overdue = Instant::now() - Duration::from_millis(FORCED_SCAN_INTERVAL_MS + 1);
+        let work = tokio::time::timeout(
+            Duration::from_millis(100), next_port_work(&mut rx, &mut ticks, overdue),
+        ).await.unwrap();
+        assert!(matches!(work, PortWork::Scan));
+        assert_eq!(rx.len(), 100);
+        assert!(matches!(next_port_work(&mut rx, &mut ticks, Instant::now()).await, PortWork::Command(_)));
+        assert_eq!(rx.len(), 99);
+    }
+
+    #[tokio::test]
+    async fn idle_or_closed_command_channel_keeps_polling() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut ticks = tokio::time::interval(Duration::from_millis(1));
+        assert!(matches!(next_port_work(&mut rx, &mut ticks, Instant::now()).await, PortWork::Scan));
+        drop(tx);
+        let work = tokio::time::timeout(
+            Duration::from_millis(100), next_port_work(&mut rx, &mut ticks, Instant::now()),
+        ).await.unwrap();
+        assert!(matches!(work, PortWork::Scan));
     }
 }
