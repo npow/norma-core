@@ -358,8 +358,8 @@ class ResumeTest(unittest.TestCase):
                       "calibration_ranges": {"leader": [[100, 1100]] * 8, "follower": [[100, 1100]] * 8},
                       "motor_ids": list(range(1, 9)), "units": "normalized", "action": "absolute"}
 
-        def open_at(root, fps=20, spec=features, collection=provenance):
-            return open_dataset(root, "local/resume-test", fps, "elrobot", spec, collection)
+        def open_at(root, fps=20, spec=features, collection=provenance, remap=False):
+            return open_dataset(root, "local/resume-test", fps, "elrobot", spec, collection, remap)
 
         def record(takes, value):
             takes.space()
@@ -414,6 +414,28 @@ class ResumeTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "Cannot resume"):
                     open_at(root, **kwargs)
                 self.assertEqual(hashes(root), snapshot)
+
+            changed = {**provenance, "cameras": {"camera_0": "new-front", "camera_1": "new-wrist"}}
+            # Remapping must still reject changed view names and image shapes without mutations.
+            for kwargs in (
+                {"collection": {**changed, "cameras": {"other": "new-front"}}},
+                {"collection": changed, "spec": {**features, "observation.state": {**features["observation.state"], "shape": (7,)}}},
+            ):
+                with self.assertRaisesRegex(ValueError, "Cannot"):
+                    open_at(root, remap=True, **kwargs)
+                self.assertEqual(hashes(root), snapshot)
+            remapped = Takes(open_at(root, collection=changed, remap=True))
+            self.assertEqual(remapped.saved, 2)
+            record(remapped, 3)
+            saved = json.loads((root / "meta/collection.json").read_text())
+            self.assertEqual(saved["cameras"], changed["cameras"])
+            self.assertEqual(saved["camera_remaps"][0]["previous"], provenance["cameras"])
+            self.assertEqual(saved["camera_remaps"][0]["from_episode"], 2)
+            for path, digest in before.items():
+                self.assertEqual(hashes(root)[path], digest)
+            resumed = Takes(open_at(root, collection=changed))
+            self.assertEqual(resumed.saved, 3)
+            resumed.finish()
 
     def test_unknown_folder_and_concurrent_recorder_are_preserved(self):
         with tempfile.TemporaryDirectory(prefix="norma-resume-guard-") as temp:

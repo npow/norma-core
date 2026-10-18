@@ -76,7 +76,7 @@ def preserve_unfinished_images(root):
     return recovery
 
 
-def open_dataset(root, repo_id, fps, robot_type, features, provenance):
+def open_dataset(root, repo_id, fps, robot_type, features, provenance, remap_cameras=False):
     """Create a dataset or validate and reopen it for appending, entirely locally."""
     from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 
@@ -93,12 +93,21 @@ def open_dataset(root, repo_id, fps, robot_type, features, provenance):
         raise ValueError(f"Cannot resume {root}: expected a dataset created by this recorder")
     info = json.loads(info_path.read_text())
     previous = json.loads(collection_path.read_text())
+    cameras_changed = previous.get("cameras") != provenance.get("cameras")
+    if remap_cameras and set(previous.get("cameras", {})) != set(provenance.get("cameras", {})):
+        raise ValueError("Cannot remap: use exactly the saved camera names")
     if info.get("codebase_version") != "v3.0":
         raise ValueError("Cannot resume: expected LeRobot v3.0")
     if info.get("fps") != fps or info.get("robot_type") != robot_type:
         raise ValueError("Cannot resume: FPS or robot type differs from the saved dataset")
     for key in ("leader_bus", "follower_bus", "cameras", "calibration_ranges", "motor_ids", "units", "action"):
+        if key == "cameras" and remap_cameras:
+            continue
         if previous.get(key) != provenance.get(key):
+            if key == "cameras":
+                raise ValueError("Cannot resume: cameras differs from the saved collection; "
+                                 "after USB re-enumeration, use --remap-cameras with "
+                                 "--camera NAME=QUEUE for every saved view (keep physical views matched)")
             raise ValueError(f"Cannot resume: {key} differs from the saved collection")
     standard = {"timestamp", "frame_index", "episode_index", "index", "task_index"}
     if set(info["features"]) - standard != set(features):
@@ -144,6 +153,16 @@ def open_dataset(root, repo_id, fps, robot_type, features, provenance):
             dataset.meta.root = root
     preserve_unfinished_images(root)
     dataset.start_image_writer(num_threads=2)
+    if cameras_changed and remap_cameras:
+        previous.setdefault("camera_remaps", []).append({
+            "from_episode": total_episodes, "previous": previous["cameras"],
+            "current": provenance["cameras"], "timestamp_unix": time.time(),
+        })
+        previous["cameras"] = provenance["cameras"]
+        pending = collection_path.with_suffix(".json.tmp")
+        pending.write_text(json.dumps(previous, indent=2) + "\n")
+        pending.replace(collection_path)
+        print(f"Camera mapping updated from episode {total_episodes:06d}; previous mapping retained in meta/collection.json.", flush=True)
     print(f"Resuming {total_episodes} saved episodes; next episode {total_episodes:06d}.", flush=True)
     return dataset
 
@@ -459,7 +478,7 @@ async def run(args):
     }
     dataset = await blocking(
         open_dataset, root, args.repo_id, args.fps, station.robot_type,
-        features_for(images, station.joint_names), provenance,
+        features_for(images, station.joint_names), provenance, args.remap_cameras,
     )
     takes = Takes(dataset, math.ceil(args.episode_seconds * args.fps) if args.episode_seconds else None)
     armed = False
@@ -563,12 +582,16 @@ def parse_args(argv=None):
     parser.add_argument("--repo-id", default="local/arm-demos")
     parser.add_argument("--task", default="", help="Natural-language instruction; required when recording")
     parser.add_argument("--camera", action="append", default=[], metavar="NAME=QUEUE")
+    parser.add_argument("--remap-cameras", action="store_true",
+                        help="Accept changed USB IDs; explicitly assign every saved view with --camera")
     parser.add_argument("--fps", type=int, default=20)
     parser.add_argument("--episode-seconds", type=float, help="Automatically stop and save each take after this many seconds")
     parser.add_argument("--max-age", type=float, default=0.2, help="Maximum source age and inter-source skew in seconds")
     parser.add_argument("--inspect", action="store_true", help="List buses/cameras without moving or recording")
     parser.add_argument("--push-to-hub", action="store_true", help="Upload privately after q (requires HF login)")
     args = parser.parse_args(argv)
+    if args.remap_cameras and not args.camera:
+        parser.error("--remap-cameras requires explicit --camera NAME=QUEUE assignments for every saved view")
     if not args.inspect and not args.task.strip():
         parser.error("--task is required for recording")
     if not 1 <= args.fps <= 60 or not 0 < args.max_age <= 1:

@@ -80,6 +80,37 @@ uv run python record.py --task "put the cube in the box" --root ~/datasets/cube-
 ```
 
 Use `--leader-bus`, `--follower-bus`, and `--server HOST:PORT` for different hardware.
+### Resume after unplugging USB cameras
+
+After unplugging cameras, USB queue IDs can change, causing
+`Cannot resume: cameras differs from the saved collection`.
+Run `uv run python record.py --inspect` to list current queue paths, then check the
+live views in Station against the saved dataset videos to identify each camera.
+For the existing white-lid dataset, `camera_0` is the top view and `camera_1` is the wrist view.
+Resume with `--remap-cameras`
+and explicit `--camera camera_0=NEW_QUEUE_PATH --camera camera_1=NEW_QUEUE_PATH`
+assignments for every saved view. Match each name to the same physical view as before;
+queue sort order may have changed. Camera names and image shapes must still match.
+The recorder retains previous IDs and the episode where the mapping changed in
+`meta/collection.json`; existing episodes are preserved. Use these explicit camera
+assignments again on subsequent launches.
+
+```bash
+uv run python record.py \
+  --task "move the white lid onto the black tray" \
+  --root ~/datasets/white-lid \
+  --remap-cameras \
+  --camera "camera_0=FULL_CURRENT_TOP_QUEUE_PATH" \
+  --camera "camera_1=FULL_CURRENT_WRIST_QUEUE_PATH"
+```
+
+Replace both queue placeholders with the full paths from `--inspect`. Use the
+original task instruction for the dataset. Press **Space** to start/stop a take
+and **q** to finish saving and quit. On later launches, keep the `--camera`
+assignments; `--remap-cameras` is only needed when those IDs change again.
+
+### Capture timing
+
 Collection defaults to 20 FPS. Slow writes and scheduling hiccups do not end the take.
 Actual capture times are saved in `meta/recording/episode-NNNNNN.json` for timing inspection.
 Calibration must already be frozen for every motor on both arms. Missing motors, changed
