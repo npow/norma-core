@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run a policy through Station. Preview by default; --execute enables Space to move."""
+"""Run and record a Station policy, with optional leader mirroring and human takeover."""
 import argparse
 import asyncio
 import base64
@@ -194,43 +194,77 @@ def payload_for(images, state):
 async def run(args):
     from bootstrap import setup
     setup()
+    import numpy as np
     from station_io import Station, vector
     from commands import send_motor_commands, set_torque
-    from record import keyboard
+    from record import keyboard, features_for
+    from intervention import GrabDetector, LeaderMirror, RolloutRecorder, mirror_targets
+    from mirror import ProtectionTable
+    from state import find_bus
 
+    recording = args.execute and not args.no_record
+    if recording:
+        # Load the ML/video stack before subscribing to live motor telemetry.
+        from lerobot.datasets.lerobot_dataset import LeRobotDataset
     metadata = await asyncio.to_thread(request_json, args.policy_url + "/metadata")
     collection = metadata["collection"]
     leader, follower = collection["leader_bus"], collection["follower_bus"]
-    cameras = collection["cameras"]
-    fps = collection["fps"]
+    cameras, fps = collection["cameras"], collection["fps"]
+    if not 0 < args.chunk_steps < metadata["chunk_size"]:
+        raise ValueError("Replan interval must be smaller than the policy action horizon")
+    if args.teleop_takeover and leader == follower:
+        raise ValueError("Leader and follower must use different buses")
     station = await Station.connect(args.server)
     armed = False
-    pending = None
-    diagnostics = None
+    pending = diagnostics = recorder = mirror = None
+    episode_open = False
+    running = False
+    mode = "policy"
+    detector = GrabDetector(args.grab_error_ticks, args.grab_current, args.grab_seconds)
     try:
         await station.discover()
-        station.configure_follower(follower, collection["motor_ids"])
-        # Trajectory tracking needs finer updates than hand-guided teleoperation.
+        if args.teleop_takeover:
+            station.configure(leader, follower)
+        else:
+            station.configure_follower(follower, collection["motor_ids"])
         station.config = replace(station.config, deadband=args.deadband_ticks)
         if list(station.motor_ids) != collection["motor_ids"]:
             raise RuntimeError("Motor order differs from training")
 
         def observe():
-            _, motors, images, calibration = station.snapshot(None, follower, cameras, args.max_age)
-            if calibration != {follower: collection["calibration_ranges"][follower]}:
+            source, motors, images, calibration = station.snapshot(
+                leader if args.teleop_takeover else None, follower, cameras, args.max_age)
+            expected = {serial: collection["calibration_ranges"][serial] for serial in calibration}
+            if calibration != expected:
                 raise RuntimeError("Calibration differs from the training dataset")
             for key, image in images.items():
                 if list(image.shape) != metadata["features"][key]["shape"]:
                     raise RuntimeError(f"{key}: camera resolution differs from training")
-            return motors, images
+            return source, motors, images
 
-        initial_motors, initial_images = observe()
-        # Initialize the PNG encoder before the user starts a trial.
-        await asyncio.to_thread(payload_for, initial_images, vector([m.present_position for m in initial_motors], initial_motors))
-        print(f"Checkpoint: {metadata['checkpoint']}")
-        print(f"{len(station.motor_ids)} motors; {fps} Hz; asynchronous replan every {args.chunk_steps} steps.")
-        print("Space starts/pauses; q quits. Support the arm when torque is released." if args.execute else "PREVIEW: no motor writes. Space starts/pauses predictions; q quits.")
-        running = False
+        source, initial_motors, initial_images = observe()
+        await asyncio.to_thread(payload_for, initial_images,
+            vector([m.present_position for m in initial_motors], initial_motors))
+        if args.teleop_takeover:
+            mirror = LeaderMirror(station, leader, args.leader_torque_limit, args.max_delta_ticks)
+        if recording:
+            features = features_for(initial_images, station.joint_names)
+            for name in ("policy_action", "leader_state"):
+                features[f"intervention.{name}"] = {"dtype": "float32", "shape": (len(station.motor_ids),), "names": station.joint_names}
+            for name in ("owner", "policy_valid", "leader_valid"):
+                features[f"intervention.{name}"] = {"dtype": "int64", "shape": (1,), "names": [name]}
+            root = args.dataset_root or (Path.home() / "datasets/rollout-interventions" / f"session-{time.time_ns()}")
+            provenance = dict(collection, action="absolute follower goal after rollout protection",
+                rollout_schema=1, ownership={"policy": 0, "human": 1, "transition": 2})
+            recorder = RolloutRecorder(root, args.repo_id, fps,
+                station.robot_type, features, provenance, args.record_queue_frames, wait=False)
+            await asyncio.to_thread(recorder.wait_ready)
+            print(f"Recording dataset: {recorder.root}")
+        print(f"Checkpoint: {metadata['checkpoint']}; {fps} Hz; replan every {args.chunk_steps} steps")
+        print("Space starts/pauses; q quits; s/f end episode as success/failure.")
+        if args.teleop_takeover:
+            print("t takes over; r resumes policy; grabbing the leader also takes over." if args.auto_takeover else "t takes over; r resumes policy (automatic grab detection disabled).")
+        print("Support the arms when torque is released." if args.execute else "PREVIEW: no motor writes or training data recorded.")
         trajectory = None
         started = None
         last_status = 0.0
@@ -238,58 +272,111 @@ async def run(args):
         last_control = None
         control_ticks = 0
         control_started = None
-        inference_ms = None
-        roundtrip_ms = None
+        inference_ms = roundtrip_ms = None
+        handoff = None
+        last_action = None
+        retained_goals = None
         log_path = args.diagnostics_jsonl or (Path.home() / "benchmarks/white-lid-smolvla-20261017/rollouts" / f"{metadata.get('policy_type', 'policy')}-{time.time_ns()}.jsonl")
         log_path.parent.mkdir(parents=True, exist_ok=True)
         diagnostics = DiagnosticWriter(log_path)
-        diagnostics.write(json.dumps({"event": "start", "checkpoint": metadata["checkpoint"], "backend": metadata.get("backend", "eager"), "execute": args.execute, "fps": fps, "replan_steps": args.chunk_steps, "deadband_ticks": args.deadband_ticks, "noise_seed": args.noise_seed}) + "\n")
+        diagnostics.write(json.dumps({"event": "start", "checkpoint": metadata["checkpoint"], "execute": args.execute,
+            "fps": fps, "backend": metadata.get("backend", "eager"), "replan_steps": args.chunk_steps,
+            "deadband_ticks": args.deadband_ticks, "noise_seed": args.noise_seed,
+            "blend_seconds": args.blend_seconds, "handoff_seconds": args.handoff_seconds,
+            "takeover": args.teleop_takeover, "auto_takeover": args.auto_takeover,
+            "leader_torque_limit": args.leader_torque_limit, "grab_error_ticks": args.grab_error_ticks,
+            "grab_current": args.grab_current, "grab_seconds": args.grab_seconds,
+            "dataset": str(recorder.root) if recorder else None}) + "\n")
         print(f"Diagnostics: {log_path}")
+
+        def cancel_prediction():
+            nonlocal pending, trajectory
+            if pending is not None:
+                pending.cancel()
+                pending = None
+            trajectory = None
+
+        async def stop_episode(reason, outcome="unreviewed"):
+            nonlocal armed, running, episode_open
+            cancel_prediction()
+            running = False
+            try:
+                if armed:
+                    await station.disable(follower)
+                    armed = False
+            finally:
+                if mirror and args.execute:
+                    await mirror.stop()
+            if recorder and episode_open:
+                recorder.end(reason, outcome)
+                episode_open = False
+            diagnostics.status(f"Stopped episode: {reason}; outcome={outcome}. Space starts another trial.")
+
         deadline = time.monotonic()
         with keyboard() as keys:
             while True:
+                if recorder:
+                    recorder.check()
                 key = keys.get_nowait() if not keys.empty() else None
                 if key in ("q", "\x04"):
+                    await stop_episode("quit")
                     break
-                if key == " ":
-                    running = not running
-                    trajectory = None
-                    if pending is not None:
-                        pending.cancel()
-                        pending = None
-                    if running:
-                        observe()
-                        started = time.monotonic()
-                        last_request = float("-inf")
-                        last_control = None
-                        control_started = None
-                        control_ticks = 0
-                        diagnostics.status("WAITING FOR FRESH PREDICTION (torque not enabled yet)")
-                    else:
-                        if armed:
-                            await station.disable(follower)
-                            armed = False
-                        print("PAUSED", flush=True)
+                if running and (key in ("s", "f") or key == " " or time.monotonic() - started >= args.seconds):
+                    reason = {"s": "success", "f": "failure", " ": "paused"}.get(key, "duration")
+                    await stop_episode(reason, reason if reason in ("success", "failure") else "unreviewed")
+                    continue
+                if key == " " and not running:
+                    source, motors, images = observe()
+                    cancel_prediction()
+                    retained_goals = [m.target_position for m in motors]
+                    started = time.monotonic()
+                    mode, running, handoff, last_action = "policy", True, None, None
+                    last_request, last_control, control_started, control_ticks = float("-inf"), None, None, 0
+                    station.protection = ProtectionTable()
+                    if recorder:
+                        recorder.begin({"checkpoint": metadata["checkpoint"], "backend": metadata.get("backend", "eager"),
+                            "started_unix_ns": time.time_ns(), "task": collection["task"],
+                            "deadband_ticks": args.deadband_ticks, "max_delta_ticks": args.max_delta_ticks,
+                            "noise_seed": args.noise_seed, "teleop_takeover": args.teleop_takeover,
+                            "auto_takeover": args.auto_takeover, "leader_torque_limit": args.leader_torque_limit,
+                            "grab_error_ticks": args.grab_error_ticks, "grab_current": args.grab_current,
+                            "grab_seconds": args.grab_seconds, "handoff_seconds": args.handoff_seconds,
+                            "blend_seconds": args.blend_seconds, "replan_steps": args.chunk_steps})
+                        episode_open = True
+                    diagnostics.status("WAITING FOR FRESH PREDICTION (torque not enabled yet)")
                     deadline = time.monotonic()
                 if not running:
-                    await asyncio.sleep(0.025)
-                    continue
-                if trajectory is not None and time.monotonic() - started >= args.seconds:
-                    if armed:
-                        await station.disable(follower)
-                        armed = False
-                    running = False
-                    trajectory = None
-                    if pending is not None:
-                        pending.cancel()
-                        pending = None
-                    print("Episode duration reached. Reset scene; Space starts another trial.", flush=True)
+                    await asyncio.sleep(.025)
                     continue
                 observe_started = time.monotonic()
-                motors, images = observe()
+                source, motors, images = observe()
+                sample_unix_ns = time.time_ns()
+                motor_timestamps = {serial: [m.get_system_stamp_ns() for m in find_bus(station.motors.latest, serial).get_motors()]
+                    for serial in ((leader, follower) if source else (follower,))}
+                camera_timestamps = {name: station.cameras[camera].latest[1] for name, camera in cameras.items()}
                 observe_ms = 1000 * (time.monotonic() - observe_started)
                 now = time.monotonic()
-                if pending is not None and pending.done():
+                state = vector([m.present_position for m in motors], motors)
+                leader_state = vector([m.present_position for m in source], source) if source else np.zeros_like(state)
+                leader_reference = mirror_targets(source, motors, station.config) if source else None
+                auto_grab = False
+                if mirror and mode == "policy" and trajectory is not None and args.auto_takeover:
+                    bus = find_bus(station.motors.latest, leader)
+                    stamp = tuple(m.get_system_stamp_ns() for m in bus.get_motors())
+                    auto_grab = detector.update(now, stamp, source, targets=leader_reference)
+                if mirror and mode != "human" and (key == "t" or auto_grab) and (armed or not args.execute):
+                    if args.execute:
+                        await mirror.stop()
+                    cancel_prediction()
+                    mode = "human"
+                    # Remove the initial mismatch, then decay that offset gradually.
+                    origin = list(last_action if last_action is not None else state)
+                    handoff = (now, origin, list(leader_state))
+                    diagnostics.status("HUMAN TAKEOVER (grab)" if auto_grab else "HUMAN TAKEOVER (key)")
+                if mirror and mode == "human" and key == "r":
+                    mode, last_request = "resuming", float("-inf")
+                    diagnostics.status("Requesting fresh policy prediction; human remains in control")
+                if mode != "human" and pending is not None and pending.done():
                     observed_at, response, roundtrip_ms = pending.result()
                     pending = None
                     chunk = response["actions"]
@@ -300,78 +387,132 @@ async def run(args):
                     diagnostics.write(json.dumps({"event": "inference", "time_s": now - started,
                         "accepted": fresh, "response_age_ms": 1000 * (now - observed_at),
                         "inference_ms": inference_ms, "roundtrip_ms": roundtrip_ms,
-                        "client_timings_ms": response.get("client_timings_ms"),
-                        "server_timings_ms": response.get("timings_ms")}) + "\n")
+                        "client_timings_ms": response.get("client_timings_ms"), "server_timings_ms": response.get("timings_ms")}) + "\n")
                     if not fresh:
                         last_request = float("-inf")
-                        diagnostics.status(f"Discarded late prediction ({1000 * (now - observed_at):.0f} ms old); requesting fresh observation")
+                        diagnostics.status("Discarded late prediction; requesting fresh observation")
                     else:
                         candidate = TimedTrajectory(observed_at, fps, chunk)
                         candidate.action_at(now)
                         if trajectory is not None:
                             candidate.splice_from(trajectory, now, args.blend_seconds)
                         else:
-                            # Enable motion only after accepting a current observation.
+                            origin = list(last_action if last_action is not None else state)
+                            handoff = (now, origin, candidate.action_at(now))
+                            if recorder:
+                                recorder.capacity()
                             if args.execute:
-                                armed = True
-                                await set_torque(station.client, follower, station.motor_ids, enable=True)
-                            started = now
-                            diagnostics.status("RUNNING")
+                                if not armed:
+                                    armed = True
+                                    retained_goals = [m.present_position for m in motors]
+                                    # Seed follower goal before torque enable.
+                                    from mirror import MotorCommand
+                                    await send_motor_commands(station.client, follower,
+                                        [MotorCommand(mid, speed=300, accel=5, goal=m.present_position)
+                                         for mid, m in zip(station.motor_ids, motors, strict=True)])
+                                    await set_torque(station.client, follower, station.motor_ids, enable=True)
+                                if mirror:
+                                    await mirror.start(source)
+                            detector.reset(now)
+                            mode = "policy"
+                            diagnostics.status("POLICY CONTROL")
                         trajectory = candidate
-                if pending is None and now - last_request >= args.chunk_steps / fps:
+                if mode != "human" and pending is None and now - last_request >= args.chunk_steps / fps:
                     last_request = now
-                    state = vector([m.present_position for m in motors], motors)
-                    pending = asyncio.create_task(predict_async(args.policy_url, now, images, state, None if args.noise_seed == -1 else args.noise_seed))
-                if trajectory is None:
-                    await asyncio.sleep(0.005)
+                    pending = asyncio.create_task(predict_async(args.policy_url, now, images, state,
+                        None if args.noise_seed == -1 else args.noise_seed))
+                if trajectory is None and mode == "policy":
+                    await asyncio.sleep(.005)
                     deadline = time.monotonic()
                     continue
-                action = trajectory.action_at(now)
+                policy_action = trajectory.action_at(now) if trajectory is not None else None
+                action = list(policy_action if mode == "policy" else leader_state)
+                transitioning = handoff is not None and now - handoff[0] < args.handoff_seconds
+                if transitioning:
+                    fraction = max(0., 1 - (now - handoff[0]) / args.handoff_seconds)
+                    action = [a + fraction * (origin - initial) for a, origin, initial in zip(action, handoff[1], handoff[2], strict=True)]
+                action = [float(value) for value in action]
+                owner = "transition" if transitioning or mode == "resuming" else mode
                 commands = protected_commands(action, motors, station.protection, station.config, args.max_delta_ticks)
+                if recorder:
+                    recorder.capacity()
                 send_started = time.monotonic()
                 if args.execute:
                     await send_motor_commands(station.client, follower, commands)
+                    if mirror and mirror.active:
+                        await mirror.step(source, motors)
                 send_ms = 1000 * (time.monotonic() - send_started)
-                current_state = vector([m.present_position for m in motors], motors)
-                goals = [m.target_position for m in motors]
+                goals = list(retained_goals)
                 for command in commands:
                     if command.goal is not None:
                         goals[command.motor_id - 1] = command.goal
+                retained_goals = goals
                 sent_state = vector(goals, motors)
+                last_action = sent_state.tolist()
+                detail = {"event": "control", "time_s": now - started, "capture_unix_ns": sample_unix_ns, "command_sent_unix_ns": time.time_ns(),
+                    "owner": owner, "mode": mode, "interval_ms": None if last_control is None else 1000 * (now - last_control),
+                    "action_age_ms": None if trajectory is None else 1000 * (now - trajectory.observed_at),
+                    "predicted_action": policy_action, "requested_action": action,
+                    "measured_state": state.tolist(), "protected_goal": sent_state.tolist(),
+                    "currents": [m.current for m in motors], "leader_state": leader_state.tolist() if source else None,
+                    "leader_currents": [m.current for m in source] if source else None,
+                    "leader_targets": [m.target_position for m in source] if source else None,
+                    "leader_tracking_targets": leader_reference,
+                    "motor_source_timestamps_ns": motor_timestamps,
+                    "camera_source_timestamps_ns": camera_timestamps,
+                    "observe_ms": observe_ms, "send_ms": send_ms,
+                    "commands": [{"motor_id": c.motor_id, "goal": c.goal, "speed": c.speed, "accel": c.accel} for c in commands]}
+                diagnostics.write(json.dumps(detail) + "\n")
+                if recorder:
+                    frame = {"observation.state": state, "action": sent_state, "task": collection["task"], **images,
+                        "intervention.policy_action": np.asarray(policy_action if policy_action is not None else np.zeros_like(state), dtype=np.float32),
+                        "intervention.leader_state": leader_state,
+                        "intervention.owner": np.asarray([{"policy": 0, "human": 1, "transition": 2}[owner]], dtype=np.int64),
+                        "intervention.policy_valid": np.asarray([policy_action is not None], dtype=np.int64),
+                        "intervention.leader_valid": np.asarray([source is not None], dtype=np.int64)}
+                    recorder.add(frame, detail)
                 if control_started is None:
                     control_started = now
                 control_ticks += 1
-                hz = (control_ticks - 1) / max(now - control_started, 1e-6)
-                diagnostics.write(json.dumps({"event": "control", "time_s": now - started, "interval_ms": None if last_control is None else 1000 * (now - last_control), "action_age_ms": 1000 * (now - trajectory.observed_at), "predicted_action": action, "measured_state": current_state.tolist(), "protected_goal": sent_state.tolist(), "currents": [m.current for m in motors], "observe_ms": observe_ms, "send_ms": send_ms, "commands": [{"motor_id": c.motor_id, "goal": c.goal, "speed": c.speed, "accel": c.accel} for c in commands]}) + "\n")
                 last_control = now
-                if time.monotonic() - last_status >= 1:
-                    diagnostics.status(f"{now - started:4.1f}s {hz:4.1f}Hz infer={inference_ms or 0:.0f}ms rtt={roundtrip_ms or 0:.0f}ms grip(pred/sent/actual)={action[-1]:.1f}/{sent_state[-1]:.1f}/{current_state[-1]:.1f} action={[round(float(v), 1) for v in action]}")
-                    last_status = time.monotonic()
+                if now - last_status >= 1:
+                    hz = (control_ticks - 1) / max(now - control_started, 1e-6)
+                    diagnostics.status(f"{now - started:4.1f}s {hz:4.1f}Hz {owner} infer={inference_ms or 0:.0f}ms rtt={roundtrip_ms or 0:.0f}ms | recording={'yes' if recorder else 'no'}")
+                    last_status = now
                 deadline += 1 / fps
                 if deadline < time.monotonic():
-                    # Do not play queued trajectory points late or in catch-up bursts.
                     deadline = time.monotonic() + 1 / fps
                 await asyncio.sleep(max(0, deadline - time.monotonic()))
     finally:
         if pending is not None:
             pending.cancel()
-        try:
-            if armed:
-                task = asyncio.create_task(station.disable(follower))
-                try:
-                    await asyncio.shield(task)
-                except asyncio.CancelledError:
-                    await task
-                    raise
-        finally:
+        async def cleanup():
             try:
-                if diagnostics is not None:
-                    diagnostics.close()
+                if armed:
+                    await station.disable(follower)
             finally:
-                station.client.close_connection()
+                try:
+                    if mirror and args.execute:
+                        await mirror.restore()
+                finally:
+                    try:
+                        if recorder is not None:
+                            await asyncio.to_thread(recorder.close)
+                    finally:
+                        try:
+                            if diagnostics is not None:
+                                await asyncio.to_thread(diagnostics.close)
+                        finally:
+                            station.client.close_connection()
+        task = asyncio.create_task(cleanup())
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            await task
+            raise
 
 
-def main():
+def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--policy-url", default="http://127.0.0.1:8765")
     parser.add_argument("--server", default="localhost")
@@ -384,7 +525,22 @@ def main():
     parser.add_argument("--blend-seconds", type=float, default=0.15)
     parser.add_argument("--deadband-ticks", type=int, default=20)
     parser.add_argument("--noise-seed", type=int, default=-1, help="Reuse sampling noise across replans; -1 samples fresh noise")
+    parser.add_argument("--teleop-takeover", action="store_true", help="Mirror follower onto leader and enable t/r handoffs")
+    parser.add_argument("--auto-takeover", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--leader-torque-limit", type=int, default=100, help="Temporary RAM torque cap, raw units; never raises the original cap")
+    parser.add_argument("--grab-error-ticks", type=int, default=80)
+    parser.add_argument("--grab-current", type=int, default=40, help="Raw current threshold; tune on hardware")
+    parser.add_argument("--grab-seconds", type=float, default=.15)
+    parser.add_argument("--handoff-seconds", type=float, default=.3)
+    parser.add_argument("--dataset-root", type=Path, help="Append-compatible rollout dataset; default: new local session directory")
+    parser.add_argument("--repo-id", default="local/rollout-interventions")
+    parser.add_argument("--no-record", action="store_true", help="Explicitly disable executed rollout recording")
+    parser.add_argument("--record-queue-frames", type=int, default=64)
     args = parser.parse_args()
+    if not 1 <= args.leader_torque_limit <= 300 or args.grab_error_ticks <= 0 or args.grab_current <= 0:
+        parser.error("Use torque limit 1–300 and positive grab thresholds")
+    if any(not math.isfinite(v) or v <= 0 for v in (args.grab_seconds, args.handoff_seconds)) or args.record_queue_frames < 1:
+        parser.error("Use finite positive grab/handoff durations and recording queue size")
     if not math.isfinite(args.seconds) or args.seconds <= 0 or not 1 <= args.chunk_steps <= 20 or not 0 < args.max_age <= 1 or args.max_delta_ticks <= 0:
         parser.error("Use positive duration/delta, 1–20 chunk steps, and max-age in (0, 1]")
     if not math.isfinite(args.blend_seconds) or not 0 <= args.blend_seconds <= 0.5:
@@ -393,12 +549,17 @@ def main():
         parser.error("--noise-seed must be -1 or an integer in [0, 2**63)")
     if not 1 <= args.deadband_ticks <= 20:
         parser.error("--deadband-ticks must be in [1, 20]")
+    return args
+
+
+def main():
+    args = parse_args()
     try:
         asyncio.run(run(args))
     except KeyboardInterrupt:
         print("Stopped.")
     except (RuntimeError, ValueError, urllib.error.URLError) as exc:
-        parser.exit(1, f"Stopped: {exc}\n")
+        raise SystemExit(f"Stopped: {exc}")
 
 
 if __name__ == "__main__":
