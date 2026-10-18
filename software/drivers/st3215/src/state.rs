@@ -33,6 +33,7 @@ pub struct ST3215BusCommunicator {
     state: Arc<parking_lot::RwLock<InferenceState>>,
     bounds: Arc<parking_lot::RwLock<MotorBounds>>,
     calibration_stops: Arc<parking_lot::RwLock<CalibrationStops>>,
+    calibration_directory: std::path::PathBuf,
 }
 
 impl ST3215BusCommunicator {
@@ -54,6 +55,7 @@ impl ST3215BusCommunicator {
             state: Arc::new(parking_lot::RwLock::new(InferenceState::default())),
             bounds: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             calibration_stops: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            calibration_directory: std::path::PathBuf::from("calibration"),
         }
     }
 
@@ -179,15 +181,19 @@ impl ST3215BusCommunicator {
         if res.is_err() {
             return Err(Box::new(res.err().unwrap()));
         }
-        if let Err(error) = crate::calibration_store::persist(std::path::Path::new("calibration"), envelope) {
-            log::warn!("Failed to persist calibration for bus '{}': {}", envelope.bus_serial, error);
-        }
+        self.persist_meta_file(envelope);
         Ok(())
     }
 
+    pub(crate) fn persist_meta_file(&self, envelope: &st3215_proto::MetaEnvelope) {
+        if let Err(error) = crate::calibration_store::persist(&self.calibration_directory, envelope) {
+            log::warn!("Failed to persist calibration for bus '{}': {}", envelope.bus_serial, error);
+        }
+    }
+
     /// Recover frozen calibration only when queue history has no record for this bus.
-    pub fn load_meta_file(bus_serial: &str) -> Option<st3215_proto::MetaEnvelope> {
-        crate::calibration_store::load(std::path::Path::new("calibration"), bus_serial)
+    pub(crate) fn load_meta_file(&self, bus_serial: &str) -> Option<st3215_proto::MetaEnvelope> {
+        crate::calibration_store::load(&self.calibration_directory, bus_serial)
     }
 
     fn add_bus(&self, bus_info: &st3215_proto::St3215Bus, envelope: &st3215_proto::RxEnvelope) {
@@ -506,5 +512,73 @@ impl ST3215BusCommunicator {
         state.state.encode(&mut buf).unwrap();
         let data = Bytes::from(buf);
         let _ = self.normfs.enqueue(&self.inference_queue_id, data);
+    }
+}
+
+#[cfg(test)]
+mod calibration_recovery_tests {
+    use super::*;
+    use crate::port_meta::St3215PortMeta;
+    use crate::st3215_proto::{MetaEnvelope, MetaEnvelopeType, MotorArc};
+
+    struct TestDirectory(std::path::PathBuf);
+    impl Drop for TestDirectory {
+        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+    }
+
+    fn frozen(serial: &str) -> MetaEnvelope {
+        MetaEnvelope {
+            bus_serial: serial.into(),
+            r#type: MetaEnvelopeType::MetFreezeCalibration as i32,
+            arcs: vec![MotorArc { motor_id: 1, min_angle: 1000, max_angle: 3000,
+                range_freezed: true, ..Default::default() }],
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_migrates_history_honors_reset_and_recovers_after_history_loss() {
+        let dir = TestDirectory(std::env::temp_dir().join(format!(
+            "norma-calibration-recovery-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+        )));
+        std::fs::create_dir_all(dir.0.join("history")).unwrap();
+        let normfs = Arc::new(NormFS::new(dir.0.join("history"), Default::default()).await.unwrap());
+        let rx = normfs.resolve("st3215/rx");
+        let tx = normfs.resolve("st3215/tx");
+        let meta = normfs.resolve("st3215/meta");
+        let inference = normfs.resolve("st3215/inference");
+        for queue in [&rx, &tx, &meta, &inference] {
+            normfs.ensure_queue_exists_for_write(queue).await.unwrap();
+        }
+        let mut comm = ST3215BusCommunicator::new(normfs.clone(), rx, tx, meta.clone(), inference);
+        comm.calibration_directory = dir.0.join("calibration");
+        let comm = Arc::new(comm);
+
+        // Simulate a freeze created before file persistence was introduced.
+        let old = frozen("old-bus");
+        normfs.enqueue(&meta, Bytes::from(old.encode_to_vec())).unwrap();
+        assert!(comm.load_meta_file("old-bus").is_none());
+        let _old_port = St3215PortMeta::new("old-bus", &comm).await.unwrap();
+        assert_eq!(comm.load_meta_file("old-bus"), Some(old));
+        assert_eq!(comm.get_bounds("old-bus", 1), Some((1000, 3000, true)));
+
+        // Queue reset wins over a stale frozen file and removes it on startup.
+        let stale = frozen("reset-bus");
+        crate::calibration_store::persist(&comm.calibration_directory, &stale).unwrap();
+        let reset = MetaEnvelope { bus_serial: "reset-bus".into(),
+            r#type: MetaEnvelopeType::MetResetCalibration as i32, ..Default::default() };
+        normfs.enqueue(&meta, Bytes::from(reset.encode_to_vec())).unwrap();
+        let _reset_port = St3215PortMeta::new("reset-bus", &comm).await.unwrap();
+        assert!(comm.load_meta_file("reset-bus").is_none());
+        assert!(comm.get_bounds("reset-bus", 1).is_none());
+
+        // No history for this bus: restore its file into normal frozen state.
+        let disk_only = frozen("disk-bus");
+        crate::calibration_store::persist(&comm.calibration_directory, &disk_only).unwrap();
+        let _disk_port = St3215PortMeta::new("disk-bus", &comm).await.unwrap();
+        assert_eq!(comm.get_bounds("disk-bus", 1), Some((1000, 3000, true)));
+        assert_eq!(comm.load_meta_file("disk-bus"), Some(disk_only));
+        normfs.close().await.unwrap();
     }
 }

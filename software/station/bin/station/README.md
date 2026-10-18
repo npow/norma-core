@@ -319,7 +319,9 @@ MIT - See [LICENSE](LICENSE)
 ST3215 freeze commands also persist calibration in `./calibration/<bus-serial>.meta`,
 relative to Station's working directory. Reset removes that bus's file. On startup,
 a valid frozen record is restored only if queue history has no record for that bus;
-an existing reset or freeze in history takes precedence. Keep Station's working
+an existing reset or freeze in history takes precedence and is migrated to the
+file store at startup. Recovery rejects empty, duplicate, unfrozen, or out-of-range
+motor bounds. Keep Station's working
 directory stable and preserve `calibration/` when clearing queue history. Files are
 replaced atomically; persistence errors are logged. Do not place the NormFS history
 folder at `.` if you intend to delete that whole folder.

@@ -71,21 +71,17 @@ impl St3215PortMeta {
 
         let mut meta_opt = result_rx.await.unwrap();
 
-        // Meta queue empty (e.g. the history folder was wiped): restore from the
-        // wipe-survivor calibration file and re-enqueue it so every downstream
-        // consumer sees a normal freeze record again.
-        if meta_opt.is_none() {
-            if let Some(file_meta) = ST3215BusCommunicator::load_meta_file(target_port_serial) {
-                if file_meta.r#type == MetaEnvelopeType::MetFreezeCalibration as i32 {
-                    log::info!(
-                        "Meta queue empty for bus '{}'; restoring calibration from file",
-                        target_port_serial
-                    );
-                    match comm.send_meta(&file_meta) {
-                        Ok(()) => meta_opt = Some(file_meta),
-                        Err(e) => log::warn!("Failed to re-enqueue restored calibration: {:?}", e),
-                    }
-                }
+        if let Some(meta) = meta_opt.as_ref() {
+            // Migrate pre-existing history and remove stale files after a reset.
+            comm.persist_meta_file(meta);
+        } else if let Some(file_meta) = comm.load_meta_file(target_port_serial) {
+            log::info!(
+                "Meta queue empty for bus '{}'; restoring calibration from file",
+                target_port_serial
+            );
+            match comm.send_meta(&file_meta) {
+                Ok(()) => meta_opt = Some(file_meta),
+                Err(e) => log::warn!("Failed to re-enqueue restored calibration: {:?}", e),
             }
         }
 
